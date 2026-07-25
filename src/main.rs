@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use toml;
 
 
-use crate::{monitors::Monitor, writer::Block};
+use crate::{monitors::Monitor, writer::{Block, TerminalGuard}};
 mod monitors;
 
 mod writer;
@@ -21,13 +21,14 @@ notify-send "通知标题" "通知正文内容"
 */
 
 struct Register {
-    fdm:Vec<u8>,
+    fdm:Vec<usize>,
     fds:Vec<libc::pollfd>,
     monitors:Vec<Box<dyn Monitor>>,
     commander:commander::Commander,
     writer:writer::Writer,
     sort:Vec<Vec<usize>>,
     selector:(u8,u8),
+    flush:bool
 }
 impl Register {
     fn new(writer:writer::Writer) -> Self {
@@ -39,6 +40,7 @@ impl Register {
             writer,
             sort:Vec::new(),
             selector:(0,0),
+            flush:true
         }
     }
 
@@ -53,20 +55,28 @@ impl Register {
     }
 
     fn regist(&mut self,fds: Vec<libc::pollfd>,monitor:Box<dyn Monitor>,block:Block,command:String){
-        self.fdm.push(fds.len() as u8);
+        self.fdm.push(fds.len());
         self.fds.extend(fds);
         self.monitors.push(monitor);
         self.writer.add_block(block);
         self.commander.add_command(command);
     }
 
-    fn run_command(&mut self){
+    fn run_command(&mut self,t:&TerminalGuard,out: &mut impl Write){
         let selector = self.writer.get_selector() as usize;
         let cmd = self.commander.command(selector);
-        let terminal_guard = writer::TerminalGuard::new().expect("终端初始化失败");
-        terminal_guard.yield_terminal(|| {
-            let _ = std::process::Command::new("sh").arg("-c").arg(cmd).status();
-        });
+        match t.yield_terminal(|| {
+            std::process::Command::new("sh").arg("-c").arg(cmd).status()
+        }) {
+            Ok(status) => {
+                if status.success(){
+                    
+                }
+            }
+            Err(_) => {}
+        }
+        self.flush = true;
+        self.writer.update_all(out);
     }
 
     fn selector_up(&mut self,out: &mut impl Write) {
@@ -403,7 +413,7 @@ fn main() {
 }
 
 fn mainloop() {
-    let _terminal_guard = writer::TerminalGuard::new().expect("终端初始化失败");
+    let terminal_guard = writer::TerminalGuard::new().expect("终端初始化失败");
 
     let mut out = std::io::stdout().lock();
 
@@ -417,7 +427,6 @@ fn mainloop() {
 
     register.init(&mut out);
 
-    let mut flush = true;
     // 主循环
     loop {
         let ret = unsafe { libc::poll(register.fds.as_mut_ptr(), register.fds.len() as u64, -1) };
@@ -435,25 +444,25 @@ fn mainloop() {
         if register.fds[0].revents & libc::POLLIN != 0 {
             let mut buf = [0u8; 3];
             let n = unsafe { libc::read(register.fds[0].fd, buf.as_mut_ptr() as _, 3) };
-            if n > 0 && flush {
+            if n > 0 && register.flush {
                 if buf[0] == b'q' { break; }
                 if buf[0] == b'n' { notepad(); }
                 if buf[0] == b'h' { register.selector_left(&mut out); }
                 if buf[0] == b'j' { register.selector_down(&mut out); }
                 if buf[0] == b'k' { register.selector_up(&mut out); }
                 if buf[0] == b'l' { register.selector_right(&mut out); }
-                if buf[0] == b'e' { flush = false; register.run_command(); }
+                if buf[0] == b'e' { register.flush = false; register.run_command(&terminal_guard,&mut out); }
             }
             register.fds[0].revents = 0;
         }
 
         for i in 1..register.fds.len() {
             if register.fds[i].revents & libc::POLLIN != 0 {
-                let mut i_copy = i as u8 - 1;
+                let mut i_copy = i - 1;
                 for (enu,&m) in register.fdm.iter().enumerate() {
                     if i_copy < m {
                         let s = register.monitors[enu].get_data();
-                        if flush {
+                        if register.flush {
                             register.writer.update_block(&mut out, enu, s);
                         }
                         break;
@@ -466,7 +475,7 @@ fn mainloop() {
         }
 
         register.writer.check_size(&mut out);
-        if flush {
+        if register.flush {
             out.flush().unwrap();
         }
     }

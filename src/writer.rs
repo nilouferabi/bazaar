@@ -10,17 +10,41 @@ pub struct TerminalGuard;
 impl TerminalGuard {
     pub fn new() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen)?;
-        execute!(stdout(), Hide)?;
+        execute!(stdout(), EnterAlternateScreen, Hide)?;
         Ok(Self)
     }
 
-    pub fn yield_terminal<F, R>(&self, f: F) -> R
+    pub fn leave_terminal(&self) -> Result<()> {
+        execute!(stdout(), Show, LeaveAlternateScreen)?;
+        disable_raw_mode()?;
+        Ok(())
+    }
+
+    /// 重新接管终端
+    pub fn enter_terminal(&self) -> Result<()> {
+        enable_raw_mode()?;
+        execute!(stdout(), EnterAlternateScreen, Hide)?;
+        Ok(())
+    }
+
+    pub fn yield_terminal<F, R>(&self, f: F) -> Result<R>
     where
-        F: FnOnce() -> R,
+        F: FnOnce() -> Result<R>,
     {
-        let result = f();
-        result
+        struct RestoreGuard;
+        impl Drop for RestoreGuard {
+            fn drop(&mut self) {
+                let _ = enable_raw_mode();
+                let _ = execute!(stdout(), EnterAlternateScreen, Hide);
+            }
+        }
+
+        let _guard = RestoreGuard;
+
+        execute!(stdout(), Show, LeaveAlternateScreen)?;
+        disable_raw_mode()?;
+
+        f()
     }
 }
 
@@ -125,7 +149,7 @@ impl Writer {
         let border = "─".repeat(content_width);
         let context = " ".repeat(content_width);
 
-        let _ = queue!(out, MoveTo(0, 0));
+        let _ = queue!(out,Clear(ClearType::All),MoveTo(0,0));
         let _ = writeln!(out, "╭{border}╮\r");
         let _ = writeln!(out, "│{context}│\r");
         let _ = writeln!(out, "│{context}│\r");
