@@ -26,26 +26,6 @@ impl TerminalGuard {
         execute!(stdout(), EnterAlternateScreen, Hide)?;
         Ok(())
     }
-
-    pub fn yield_terminal<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce() -> Result<R>,
-    {
-        struct RestoreGuard;
-        impl Drop for RestoreGuard {
-            fn drop(&mut self) {
-                let _ = enable_raw_mode();
-                let _ = execute!(stdout(), EnterAlternateScreen, Hide);
-            }
-        }
-
-        let _guard = RestoreGuard;
-
-        execute!(stdout(), Show, LeaveAlternateScreen)?;
-        disable_raw_mode()?;
-
-        f()
-    }
 }
 
 impl Drop for TerminalGuard {
@@ -96,17 +76,19 @@ pub struct Writer {
     rows:u16,
     blocks:Vec<Block>,
     selector:u16,
+    height:u16,
     _layout:String,
 }
 impl Writer {
     pub fn start(out: &mut impl Write,layout:String) -> Self {
         let (cols,rows) = size().unwrap_or((80,24));
-        //从layout获取block的数量
+        //从layout获取
         let mut writer = Self {
             cols:cols,
             rows:rows,
             blocks:Vec::new(),
             selector:0,
+            height:layout.trim().parse().unwrap_or(2) + 2,
             _layout:layout,
         };
         writer.print_background(out);
@@ -220,27 +202,3 @@ fn print_block(out: &mut impl Write, cols:u16, rows:u16, block: &Block, is_selec
         let _ = write!(out, "{:l$}", truncated);
     }
 }
-/* 
-// 绘制背景
-fn print_background(out: &mut impl Write, cols: &u16) -> (usize, usize) {
-    let content_width = cols.saturating_sub(3) as usize;
-    let border = "─".repeat(content_width);
-    let right = content_width.saturating_sub(25);
-    let right1 = right / 2;
-    let right2 = right - right1;
-
-    let total_space = content_width.saturating_sub(45);
-    let pad_left = total_space / 2;
-    let pad_right = total_space - pad_left;
-
-    let _ = queue!(out, MoveTo(0, 0));
-    let _ = writeln!(out, "╭{border}╮\r");
-    let _ = writeln!(out, "│ {}     {}     {}     {} {:<right1$} {} {:<right2$} │\r",
-        Icons::BRIGHT, Icons::VOL, Icons::MIC, Icons::BT, "", Icons::WIFI, "");
-    let _ = writeln!(out, "│ {} workspace:   {:pad_left$}bazaar{:pad_right$} {}                     │\r",
-        Icons::WS, "", "", Icons::TIME);
-    let _ = writeln!(out, "╰{border}╯\r");
-
-    (right1, right2)
-}
-*/

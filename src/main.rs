@@ -2,8 +2,9 @@ use std::io::Write;
 use std::fs;
 use std::path::PathBuf;
 
-use toml;
+use libc::{syscall, SYS_pidfd_open, pid_t};
 
+use toml;
 
 use crate::{monitors::Monitor, writer::{Block, TerminalGuard}};
 mod monitors;
@@ -24,6 +25,7 @@ struct Register {
     fdm:Vec<usize>,
     fds:Vec<libc::pollfd>,
     monitors:Vec<Box<dyn Monitor>>,
+    pending_child:Option<PendingChild>,
     commander:commander::Commander,
     writer:writer::Writer,
     sort:Vec<Vec<usize>>,
@@ -36,6 +38,7 @@ impl Register {
             fdm:Vec::new(),
             fds:vec![libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 }],//基础FD
             monitors:Vec::new(),
+            pending_child:None,
             commander:commander::Commander::new(),
             writer,
             sort:Vec::new(),
@@ -65,18 +68,50 @@ impl Register {
     fn run_command(&mut self,t:&TerminalGuard,out: &mut impl Write){
         let selector = self.writer.get_selector() as usize;
         let cmd = self.commander.command(selector);
-        match t.yield_terminal(|| {
-            std::process::Command::new("sh").arg("-c").arg(cmd).status()
-        }) {
-            Ok(status) => {
-                if status.success(){
-                    
-                }
-            }
-            Err(_) => {}
+        
+        if let Err(e) = t.leave_terminal() {
+            eprintln!("Failed to leave terminal: {}", e);
+            return;
         }
-        self.flush = true;
-        self.writer.update_all(out);
+
+        self.fds[0].events = 0;   // 不再监听 stdin
+
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .spawn()
+        {
+            Ok(child) => {
+                let pid = child.id() as pid_t;
+                let pidfd = unsafe { syscall(SYS_pidfd_open, pid, 0) };
+
+                if pidfd < 0 {
+                    eprintln!("spawn error: pidfd < 0");
+                    let _ = t.enter_terminal();
+                    self.fds[0].events = libc::POLLIN;
+                    self.flush = true;
+                    self.writer.update_all(out);
+                }
+                
+                let pidfd = pidfd as i32;
+                self.fds.push(libc::pollfd {
+                    fd: pidfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+
+                self.pending_child = Some(PendingChild { child, pidfd });
+                self.flush = false;
+            }
+
+             Err(e) => {
+                eprintln!("spawn error: {}", e);
+                let _ = t.enter_terminal();
+                self.fds[0].events = libc::POLLIN;
+                self.flush = true;
+                self.writer.update_all(out);
+            }
+        }
     }
 
     fn selector_up(&mut self,out: &mut impl Write) {
@@ -157,6 +192,11 @@ impl Register {
     
 }
 
+struct PendingChild {
+    child: std::process::Child,
+    pidfd: i32,
+}
+
 fn get_config_path() -> Option<PathBuf> {
     unsafe extern "C" {
         fn getpwuid(uid: u32) -> *mut libc::passwd;
@@ -224,7 +264,7 @@ fn load_config(out: &mut impl Write) -> Option<Register>{
     .and_then(|v| v.as_array())
     .expect("[[components]] 配置错误");
 
-    let w = writer::Writer::start(out, layout.to_string());
+    let w = writer::Writer::start(out, layout.get("rows").expect("缺少 [layout] 配置").to_string());
 
     let mut r = Register::new(w);
     for comp in comp_list {
@@ -253,6 +293,7 @@ fn load_config(out: &mut impl Write) -> Option<Register>{
                         (Box::new(t),fds)
                     }
                     "bluetooth" => {
+                        continue;
                         let (t, fds) = monitors::BtMonitor::new();
                         (Box::new(t),fds)
                     }
@@ -342,7 +383,7 @@ rows = 2
 [[components]]
 type = "time"
 
-command = "sh command"
+command = "btop"
 
 x = "100%-23"
 y = "0%2"
@@ -360,7 +401,7 @@ length = "5"
 [[components]]
 type = "alsa"
 
-command = "sh command"
+command = "alsamixer"
 
 x = "0%8"
 y = "0%1"
@@ -369,7 +410,7 @@ length = "11"
 [[components]]
 type = "bluetooth"
 
-command = "sh command"
+command = "bluetui"
 
 x = "0%20"
 y = "0%1"
@@ -378,7 +419,7 @@ length = "30"
 [[components]]
 type = "network"
 
-command = "sh command"
+command = "nmtui"
 
 x = "50%10"
 y = "0%1"
@@ -396,7 +437,7 @@ length = "14"
 [[components]]
 type = "bazaar"
 
-command = "sh command"
+command = "yazi"
 
 x = "50%-3"
 y = "0%2"
@@ -440,18 +481,37 @@ fn mainloop() {
             continue;
         }
 
+        //监控子进程是否关闭
+        if let Some(ref mut pending) = register.pending_child {
+            if let Some(last_pfd) = register.fds.last() {
+                if last_pfd.fd == pending.pidfd && (last_pfd.revents & libc::POLLIN != 0) {
+                    let _ = pending.child.try_wait();
+                    unsafe { libc::close(pending.pidfd); }
+
+                    register.fds.pop();
+
+                    register.pending_child = None;
+
+                    if let Err(e) = terminal_guard.enter_terminal() {
+                        panic!("Failed to re-enter terminal: {}", e);
+                    }
+
+                    register.fds[0].events = libc::POLLIN;
+                    register.flush = true;
+                    register.writer.update_all(&mut out);
+                }
+            }
+        }
+
         // 按键
         if register.fds[0].revents & libc::POLLIN != 0 {
-            let mut buf = [0u8; 3];
+            let mut buf = [0u8; 8]; 
             let n = unsafe { libc::read(register.fds[0].fd, buf.as_mut_ptr() as _, 3) };
-            if n > 0 && register.flush {
-                if buf[0] == b'q' { break; }
-                if buf[0] == b'n' { notepad(); }
-                if buf[0] == b'h' { register.selector_left(&mut out); }
-                if buf[0] == b'j' { register.selector_down(&mut out); }
-                if buf[0] == b'k' { register.selector_up(&mut out); }
-                if buf[0] == b'l' { register.selector_right(&mut out); }
-                if buf[0] == b'e' { register.flush = false; register.run_command(&terminal_guard,&mut out); }
+            if n > 0 {
+                let n = n as usize;
+                if handle_stdin(&buf[..n],&mut register,&mut out,&terminal_guard) {
+                    break;
+                }
             }
             register.fds[0].revents = 0;
         }
@@ -474,16 +534,51 @@ fn mainloop() {
             register.fds[i].revents = 0;
         }
 
-        register.writer.check_size(&mut out);
         if register.flush {
+            register.writer.check_size(&mut out);
             out.flush().unwrap();
         }
     }
 }
 
+fn handle_stdin(data:&[u8],r : &mut Register, out: &mut impl Write ,t : &TerminalGuard) -> bool{
+    if data.is_empty() { return false; }
+
+    if data[0] == b'q' { return true; }
+
+    if data[0] == b'n' { notepad(); return false; }
+
+    if data == b"\n" || data == b"\r" {
+        r.run_command(t, out);
+        return false;
+    }
+
+    if data.len() >= 3 && data[0] == 0x1b && data[1] == b'[' {
+        match data[2] {
+            b'A' => r.selector_up(out),
+            b'B' => r.selector_down(out),
+            b'C' => r.selector_right(out),
+            b'D' => r.selector_left(out),
+            _ => {}
+        }
+        return false;
+    }
+
+    if data.len() == 1 {
+        match data[0] {
+            b'h' => r.selector_left(out),
+            b'j' => r.selector_down(out),
+            b'k' => r.selector_up(out),
+            b'l' => r.selector_right(out),
+            _ => {}
+        }
+    }
+
+    false
+}
+
 fn notepad(){
 
 }
-
 
 //消息通知
