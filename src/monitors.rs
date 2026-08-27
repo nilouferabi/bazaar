@@ -1,12 +1,21 @@
-use libc::{pollfd, inotify_init1, inotify_add_watch, timerfd_create, timerfd_settime, read};
+use libc::{
+    pollfd, inotify_init1, inotify_add_watch, timerfd_create, timerfd_settime, read,
+    eventfd, EFD_NONBLOCK, write, close
+};
 use libc::{IN_MODIFY, IN_NONBLOCK, CLOCK_MONOTONIC, TFD_NONBLOCK, itimerspec};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use std::io::{BufRead, BufReader,Read};
+use std::io::Read;
 use std::os::fd::AsRawFd;
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::collections::HashMap;
 
 use alsa::mixer::{Mixer, SelemId, SelemChannelId};
 use alsa::poll::Descriptors;
+
+use zbus::blocking::Connection;
+use zbus::blocking::proxy::Proxy;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 // 图标常量
 struct Icons;
@@ -19,7 +28,7 @@ impl Icons {
     const WS: &'static str = "󰙅";
     const TIME: &'static str = "󰃰";
 }
-
+/*
 // 子进程守卫：退出时自动杀死子进程，防止泄漏
 struct ProcessGuard(std::process::Child);
 impl Drop for ProcessGuard {
@@ -28,7 +37,7 @@ impl Drop for ProcessGuard {
         let _ = self.0.wait();
     }
 }
-
+*/
 pub trait Monitor:{
     fn new() -> (Self,Vec<pollfd>)
     where
@@ -37,6 +46,7 @@ pub trait Monitor:{
         "none".to_string()
     }
 }
+
 
 pub struct Bazaar;
 impl Monitor for Bazaar {
@@ -209,7 +219,7 @@ impl Monitor for ALSAMonitor {
         format!("{} {}% {} {}%", Icons::VOL, vol, Icons::MIC, mic)
     }
 }
-
+/*
 // WiFi监听
 pub struct NmMonitor {
     reader: BufReader<ChildStdout>,
@@ -292,7 +302,7 @@ impl Monitor for BtMonitor {
 
 // 获取蓝牙设备
 fn get_current_bt() -> String {
-    let output = Some("none");//run_cmd("bluetoothctl", &["devices", "Connected"], 100);
+    let output = Some("");//run_cmd("bluetoothctl", &["devices", "Connected"], 100);
     let lines = output.as_ref().map(|s| s.lines().collect::<Vec<_>>());
 
     match lines {
@@ -337,6 +347,170 @@ fn run_cmd(cmd: &str, args: &[&str], timeout_ms: u64) -> Option<String> {
             }
             Err(_) => return None,
         }
+    }
+}*/
+pub struct NmMonitor {
+    conn: Connection,
+    cache: String,
+}
+
+impl Monitor for NmMonitor {
+    fn new() -> (Self, Vec<pollfd>) {
+        let conn = Connection::system().expect("无法连接系统 DBus");
+
+        let mut monitor = Self {
+            conn,
+            cache: String::new(),
+        };
+        monitor.refresh_cache();
+        (monitor, vec![pollfd { fd: -1, events: 0, revents: 0 }])
+    }
+
+    fn get_data(&mut self) -> String {
+        self.refresh_cache();
+        format!("{} {}", Icons::WIFI, self.cache)
+    }
+}
+
+impl NmMonitor {
+    fn refresh_cache(&mut self) {
+        self.cache = get_current_wifi(&self.conn);
+    }
+}
+
+fn get_current_wifi(conn: &Connection) -> String {
+    let Ok(nm_proxy) = Proxy::new(
+        conn,
+        "org.freedesktop.NetworkManager",
+        "/org/freedesktop/NetworkManager",
+        "org.freedesktop.NetworkManager",
+    ) else {
+        return "none".to_string();
+    };
+
+    let Ok(devices) = nm_proxy.call::<_, _, Vec<OwnedObjectPath>>("GetDevices", &()) else {
+        return "none".to_string();
+    };
+
+    for device_path in devices {
+        let Ok(dev_proxy) = Proxy::new(
+            conn,
+            "org.freedesktop.NetworkManager",
+            device_path.as_str(),
+            "org.freedesktop.NetworkManager.Device",
+        ) else {
+            continue;
+        };
+
+        // NM_DEVICE_TYPE_WIFI = 2
+        let Ok(device_type) = dev_proxy.get_property::<u32>("DeviceType") else {
+            continue;
+        };
+        if device_type != 2 {
+            continue;
+        }
+
+        let Ok(active_conn) = dev_proxy.get_property::<OwnedObjectPath>("ActiveConnection") else {
+            continue;
+        };
+        if active_conn.as_str() == "/" {
+            continue;
+        }
+
+        let Ok(conn_proxy) = Proxy::new(
+            conn,
+            "org.freedesktop.NetworkManager",
+            active_conn.as_str(),
+            "org.freedesktop.NetworkManager.Connection.Active",
+        ) else {
+            continue;
+        };
+        let Ok(id) = conn_proxy.get_property::<String>("Id") else {
+            continue;
+        };
+
+        return id;
+    }
+
+    "none".to_string()
+}
+pub struct BtMonitor {
+    conn: Connection,
+    cache: String,
+}
+
+impl Monitor for BtMonitor {
+    fn new() -> (Self, Vec<pollfd>) {
+        let conn = Connection::system().expect("无法连接系统 DBus");
+        let mut monitor = Self {
+            conn,
+            cache: String::new(),
+        };
+        monitor.refresh_cache();
+        (monitor, vec![pollfd { fd: -1, events: 0, revents: 0 }])
+    }
+
+    fn get_data(&mut self) -> String {
+        self.refresh_cache();
+        format!("{} {}", Icons::BT, self.cache)
+    }
+}
+
+impl BtMonitor {
+    fn refresh_cache(&mut self) {
+        self.cache = get_current_bt(&self.conn);
+    }
+}
+
+fn get_current_bt(conn: &Connection) -> String {
+    let Ok(obj_mgr) = Proxy::new(
+        conn,
+        "org.bluez",
+        "/org/bluez",
+        "org.freedesktop.DBus.ObjectManager",
+    ) else {
+        return "conn_err1".to_string();
+    };
+
+    let Ok(objects) = obj_mgr.call::<_, _, HashMap<
+        OwnedObjectPath,
+        HashMap<String, HashMap<String, OwnedValue>>,
+    >>("GetManagedObjects", &()) else {
+        return "conn_err2".to_string();
+    };
+
+    let mut names = String::new();
+
+    for (_, ifaces) in objects {
+        let Some(device_props) = ifaces.get("org.bluez.Device1") else {
+            continue;
+        };
+
+        let Some(connected) = device_props
+            .get("Connected")
+            .and_then(|v| v.downcast_ref::<bool>().ok())
+        else {
+            continue;
+        };
+
+        if connected {
+            let name = device_props
+                .get("Name")
+                .and_then(|v| v.downcast_ref::<String>().ok())
+                .clone() // 将 &String 克隆为拥有所有权的 String
+                .unwrap_or_else(|| "unknown".to_string());
+
+            if !names.is_empty() {
+                names.push(' ');
+            }
+            names.push_str(&name);
+        }
+    }
+
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names
     }
 }
 

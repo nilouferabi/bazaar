@@ -11,15 +11,6 @@ mod monitors;
 
 mod writer;
 mod commander;
-//use rustbus
-/*
-[liuno@liuno ~]$ sudo busctl monitor org.freedesktop.NetworkManager
-[liuno@liuno ~]$ sudo busctl monitor net.connman.iwd
-[liuno@liuno ~]$ sudo busctl monitor org.bluez
-[liuno@liuno ~]$ sudo busctl monitor org.freedesktop.Notifications
-
-notify-send "通知标题" "通知正文内容"
-*/
 
 struct Register {
     fdm:Vec<usize>,
@@ -293,7 +284,6 @@ fn load_config(out: &mut impl Write) -> Option<Register>{
                         (Box::new(t),fds)
                     }
                     "bluetooth" => {
-                        continue;
                         let (t, fds) = monitors::BtMonitor::new();
                         (Box::new(t),fds)
                     }
@@ -428,7 +418,7 @@ length = "30"
 [[components]]
 type = "workspace"
 
-command = "sh command"
+command = "ncdu"
 
 x = "0%2"
 y = "0%2"
@@ -572,6 +562,7 @@ fn handle_stdin(data:&[u8],r : &mut Register, out: &mut impl Write ,t : &Termina
             b'l' => r.selector_right(out),
             _ => {}
         }
+        return false;
     }
 
     false
