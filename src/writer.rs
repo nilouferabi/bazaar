@@ -76,7 +76,7 @@ pub struct Writer {
     rows:u16,
     blocks:Vec<Block>,
     selector:u16,
-    height:u16,
+    _height:u16,
     _layout:String,
 }
 impl Writer {
@@ -88,7 +88,7 @@ impl Writer {
             rows:rows,
             blocks:Vec::new(),
             selector:0,
-            height:layout.trim().parse().unwrap_or(2) + 2,
+            _height:layout.trim().parse().unwrap_or(2) + 2,
             _layout:layout,
         };
         writer.print_background(out);
@@ -146,6 +146,13 @@ impl Writer {
         print_block(out,self.cols,self.rows,&self.blocks[i],i == self.selector as usize);
     }
 
+    pub fn update_block_without_print(&mut self, i:usize, latest:String){
+        if  self.blocks[i].get_latest() == latest{
+            return;
+        }
+        self.blocks[i].update(latest);
+    }
+
     pub fn check_size(&mut self,out: &mut impl Write){
         let (cols,rows) = size().unwrap_or((80,24));
         if cols != self.cols || rows != self.rows{
@@ -178,13 +185,16 @@ fn print_block(out: &mut impl Write, cols:u16, rows:u16, block: &Block, is_selec
     let final_y = (base_y + block.dy as i32).max(0) as u16;
     let _ = queue!(out, MoveTo(final_x,final_y));
 
-    let l_max = (cols - final_x) as usize;
+    let l_max = cols.saturating_sub(final_y) as usize;
     let l = (block.l as usize).min(l_max);
 
     if l == 0 {
         return;
     }
-    
+   
+    let _ = write!(out, "{:l$}", "");
+    let _ = queue!(out, MoveTo(final_x, final_y));
+
     // 安全截断UTF-8字符串，不产生堆分配
     let mut chars = block.get_latest().chars();
     let mut byte_len = 0;

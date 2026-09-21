@@ -382,7 +382,7 @@ length = "21"
 [[components]]
 type = "brightness"
 
-command = "sh command"
+command = ""
 
 x = "0%2"
 y = "0%1"
@@ -512,9 +512,8 @@ fn mainloop() {
                 for (enu,&m) in register.fdm.iter().enumerate() {
                     if i_copy < m {
                         let s = register.monitors[enu].get_data();
-                        if register.flush {
-                            register.writer.update_block(&mut out, enu, s);
-                        }
+                        if register.flush { register.writer.update_block(&mut out, enu, s); }
+                        else { register.writer.update_block_without_print(enu, s); }
                         break;
                     }
                     i_copy -= m;

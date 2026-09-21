@@ -1,13 +1,7 @@
-use libc::{
-    pollfd, inotify_init1, inotify_add_watch, timerfd_create, timerfd_settime, read,
-    eventfd, EFD_NONBLOCK, write, close
-};
+use libc::{inotify_add_watch, inotify_init1, pollfd, read, timerfd_create, timerfd_settime};
 use libc::{IN_MODIFY, IN_NONBLOCK, CLOCK_MONOTONIC, TFD_NONBLOCK, itimerspec};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use std::io::Read;
-use std::os::fd::AsRawFd;
-use std::process::{Command, Stdio};
-use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use std::collections::HashMap;
 
 use alsa::mixer::{Mixer, SelemId, SelemChannelId};
@@ -349,24 +343,77 @@ fn run_cmd(cmd: &str, args: &[&str], timeout_ms: u64) -> Option<String> {
         }
     }
 }*/
+
+use std::os::unix::io::AsRawFd;
+use std::thread;
+use nix::unistd::{pipe2, write, read as nix_read};
+use nix::fcntl::OFlag;
+use zbus::blocking::MessageIterator;
+use zbus::MatchRule;
+use zbus::message::Type;
+
 pub struct NmMonitor {
     conn: Connection,
     cache: String,
+    pipe_rd: std::fs::File,
 }
 
 impl Monitor for NmMonitor {
     fn new() -> (Self, Vec<pollfd>) {
+        let (rd_owned, wr_owned) = pipe2(OFlag::O_NONBLOCK).unwrap();
+        let pipe_rd = std::fs::File::from(rd_owned);
+        let pipe_wr = std::fs::File::from(wr_owned);
+
         let conn = Connection::system().expect("无法连接系统 DBus");
 
+        let conn_clone = conn.clone();
+
+        thread::spawn(move || {
+            let rule = MatchRule::builder()
+                .msg_type(Type::Signal)
+                .interface("org.freedesktop.DBus.Properties").unwrap()
+                .member("PropertiesChanged").unwrap()
+                .path_namespace("/org/freedesktop/NetworkManager").unwrap()
+                .build();
+
+            let msg_iter = MessageIterator::for_match_rule(rule, &conn_clone, Some(1)).unwrap();
+            
+            for msg in msg_iter {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => break,
+                };
+                let body = msg.body();
+                let parse_res = body.deserialize::<(
+                    &str,
+                    std::collections::HashMap<String, OwnedValue>,
+                    Vec<String>
+                )>();
+                if let Ok((iface, _, _)) = parse_res {
+                    if iface == "org.freedesktop.NetworkManager.Device" {
+                        let _ = write(&pipe_wr, &[b'x']);
+                    }
+                }
+            }
+        });
         let mut monitor = Self {
             conn,
             cache: String::new(),
+            pipe_rd,
         };
         monitor.refresh_cache();
-        (monitor, vec![pollfd { fd: -1, events: 0, revents: 0 }])
+        
+        let pfd = pollfd {
+            fd: monitor.pipe_rd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        (monitor, vec![pfd]) 
     }
 
     fn get_data(&mut self) -> String {
+        let mut buf = [0u8;32];
+        let _ = nix_read(&self.pipe_rd, &mut buf);
         self.refresh_cache();
         format!("{} {}", Icons::WIFI, self.cache)
     }
@@ -437,21 +484,66 @@ fn get_current_wifi(conn: &Connection) -> String {
 pub struct BtMonitor {
     conn: Connection,
     cache: String,
+    pipe_rd: std::fs::File,
 }
 
 impl Monitor for BtMonitor {
     fn new() -> (Self, Vec<pollfd>) {
+        let (rd_owned, wr_owned) = pipe2(OFlag::O_NONBLOCK).unwrap();
+        let pipe_rd = std::fs::File::from(rd_owned);
+        let pipe_wr = std::fs::File::from(wr_owned);
+
         let conn = Connection::system().expect("无法连接系统 DBus");
+        let conn_clone = conn.clone();
+
+        thread::spawn(move || {
+            let rule = MatchRule::builder()
+                .msg_type(Type::Signal) // msg_type 直接返回builder，无Result
+                .interface("org.freedesktop.DBus.Properties").unwrap()
+                .member("PropertiesChanged").unwrap()
+                .path_namespace("/org/bluez").unwrap()
+                .build(); // build() 返回 MatchRule，不是Result
+            
+            let msg_iter = MessageIterator::for_match_rule(rule, &conn_clone, Some(1)).unwrap();
+
+            for msg in msg_iter {
+                //eprintln!("y");
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => break,
+                };
+                let body = msg.body();
+                let parse_res = body.deserialize::<(
+                    &str,
+                    std::collections::HashMap<String, OwnedValue>,
+                    Vec<String>
+                )>();
+                if let Ok((iface, _, _)) = parse_res {
+                    if iface == "org.bluez.Device1" {
+                        let _ = write(&pipe_wr, &[b'x']);
+                    }
+                }
+            }
+        });
+
         let mut monitor = Self {
             conn,
             cache: String::new(),
+            pipe_rd,
         };
         monitor.refresh_cache();
-        (monitor, vec![pollfd { fd: -1, events: 0, revents: 0 }])
+        let pfd = pollfd {
+            fd: monitor.pipe_rd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        (monitor, vec![pfd])
     }
 
     fn get_data(&mut self) -> String {
-        self.refresh_cache();
+        let mut buf = [0u8; 32];
+        let _ = nix_read(&self.pipe_rd, &mut buf);
+        self.cache = get_current_bt(&self.conn);
         format!("{} {}", Icons::BT, self.cache)
     }
 }
@@ -466,7 +558,7 @@ fn get_current_bt(conn: &Connection) -> String {
     let Ok(obj_mgr) = Proxy::new(
         conn,
         "org.bluez",
-        "/org/bluez",
+        "/",
         "org.freedesktop.DBus.ObjectManager",
     ) else {
         return "conn_err1".to_string();
