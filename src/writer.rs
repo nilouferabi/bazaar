@@ -9,14 +9,20 @@ use crossterm::style::Stylize;
 pub struct TerminalGuard;
 impl TerminalGuard {
     pub fn new() -> Result<Self> {
+        // 先存好"干净"的 termios，之后 raw mode 出任何事都能还原回去
+        crate::error::save_terminal_state();
+
         enable_raw_mode()?;
         execute!(stdout(), EnterAlternateScreen, Hide)?;
+        crate::error::set_terminal_owned(true);
         Ok(Self)
     }
 
     pub fn leave_terminal(&self) -> Result<()> {
         execute!(stdout(), Show, LeaveAlternateScreen)?;
         disable_raw_mode()?;
+        // 终端交出去了（通常是给子进程），这期间出事不归我们恢复
+        crate::error::set_terminal_owned(false);
         Ok(())
     }
 
@@ -24,14 +30,16 @@ impl TerminalGuard {
     pub fn enter_terminal(&self) -> Result<()> {
         enable_raw_mode()?;
         execute!(stdout(), EnterAlternateScreen, Hide)?;
+        crate::error::set_terminal_owned(true);
         Ok(())
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), Show, LeaveAlternateScreen);
-        let _ = disable_raw_mode();
+        // 走统一的恢复流程：与 panic hook、信号处理器共用同一条幂等路径，
+        // 避免"三处各写一份、其中一处漏了"。
+        crate::error::restore_terminal_at_exit();
     }
 }
 pub struct Block {

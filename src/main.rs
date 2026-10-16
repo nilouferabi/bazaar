@@ -6,11 +6,12 @@ use libc::{syscall, SYS_pidfd_open, pid_t};
 
 use toml;
 
-use crate::{monitors::Monitor, writer::{Block, TerminalGuard}};
+use crate::{error::Context, monitors::Monitor, writer::{Block, TerminalGuard}};
 mod monitors;
 
 mod writer;
 mod commander;
+mod error;
 
 struct Register {
     fdm:Vec<usize>,
@@ -74,10 +75,16 @@ impl Register {
         {
             Ok(child) => {
                 let pid = child.id() as pid_t;
+                // 登记 pid：这样就算进程被 SIGTERM/SIGHUP 打死，子进程也不会变成孤儿
+                error::track_child(pid as i32);
                 let pidfd = unsafe { syscall(SYS_pidfd_open, pid, 0) };
 
                 if pidfd < 0 {
                     eprintln!("spawn error: pidfd < 0");
+                    // TODO(严重): 这里少一个 return，会把 fd=-1 塞进 fds、
+                    // 让这个 child 永远没人 wait（僵尸），并覆盖后面的 flush 状态。
+                    // 暂时先取消登记，避免退出时按过期 pid 误杀别的进程。
+                    error::untrack_child();
                     let _ = t.enter_terminal();
                     self.fds[0].events = libc::POLLIN;
                     self.flush = true;
@@ -440,35 +447,33 @@ length = "6"
 }
 
 fn main() {
-    mainloop();
+    // 唯一出口：安装 panic hook / 信号处理器，跑主循环，按错误类别定退出码
+    error::run(mainloop);
 }
 
-fn mainloop() {
-    let terminal_guard = writer::TerminalGuard::new().expect("终端初始化失败");
+fn mainloop() -> error::Result<()> {
+    let terminal_guard = writer::TerminalGuard::new()
+        .map_err(|e| error::Error::terminal("初始化终端", e))?;
 
     let mut out = std::io::stdout().lock();
 
     // 从配置文件创建注册表
-    let mut register = match load_config(&mut out) {
-        Some(r ) => r,
-        None => {
-            panic!()
-        }
-    };
+    let mut register = load_config(&mut out).ok_or_else(|| {
+        error::Error::config("配置文件不可用（~/.config/bazaar/config.toml 无法读取或解析）")
+    })?;
 
     register.init(&mut out);
 
     // 主循环
     loop {
         let ret = unsafe { libc::poll(register.fds.as_mut_ptr(), register.fds.len() as u64, -1) };
-        if ret < 0 { 
-            if ret == -1  {
-                let err = unsafe { *libc::__errno_location() };
-                if err == libc::EINTR {
-                    continue;
-                }
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue; // 被信号打断，重来
             }
-            continue;
+            // 其余错误（ENOMEM/EINVAL…）再 continue 就是 100% CPU 空转，直接按错误退出
+            return Err(error::Error::io("监听终端事件(poll)", err));
         }
 
         //监控子进程是否关闭
@@ -481,10 +486,11 @@ fn mainloop() {
                     register.fds.pop();
 
                     register.pending_child = None;
+                    error::untrack_child();
 
-                    if let Err(e) = terminal_guard.enter_terminal() {
-                        panic!("Failed to re-enter terminal: {}", e);
-                    }
+                    terminal_guard
+                        .enter_terminal()
+                        .map_err(|e| error::Error::terminal("重新接管终端", e))?;
 
                     register.fds[0].events = libc::POLLIN;
                     register.flush = true;
@@ -525,9 +531,11 @@ fn mainloop() {
 
         if register.flush {
             register.writer.check_size(&mut out);
-            out.flush().unwrap();
+            out.flush().context("刷新输出")?;
         }
     }
+
+    Ok(())
 }
 
 fn handle_stdin(data:&[u8],r : &mut Register, out: &mut impl Write ,t : &TerminalGuard) -> bool{
